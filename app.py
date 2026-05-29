@@ -17,13 +17,10 @@ st.set_page_config(
 
 st.title("📈 株価トレンドライン分析")
 
-# Chart config: disable zoom drag, hide zoom toolbar buttons
+# Chart config: pan on drag (no box-select zoom), keep scroll/button zoom
 CHART_CONFIG = {
-    "scrollZoom": False,
-    "modeBarButtonsToRemove": [
-        "zoom2d", "select2d", "lasso2d",
-        "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d",
-    ],
+    "scrollZoom": True,
+    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
     "displaylogo": False,
 }
 
@@ -95,7 +92,7 @@ def build_chart(
         xaxis_title="日付",
         yaxis_title="株価",
         xaxis_rangeslider_visible=False,
-        dragmode=False,
+        dragmode="pan",
         height=height,
         template="plotly_dark",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
@@ -135,7 +132,7 @@ def render_stock_chart(ticker: str, name: str, period: str, pivot_window: int, n
         fig_vol.update_layout(
             height=130, template="plotly_dark",
             margin=dict(t=10, b=10), xaxis_rangeslider_visible=False,
-            dragmode=False,
+            dragmode="pan",
         )
         st.plotly_chart(fig_vol, use_container_width=True, config=CHART_CONFIG)
 
@@ -333,7 +330,7 @@ with tab2:
                 xaxis_title="トレンドスコア",
                 yaxis=dict(autorange="reversed"),
                 margin=dict(l=200),
-                dragmode=False,
+                dragmode="pan",
             )
             st.plotly_chart(fig_bar, use_container_width=True, config=CHART_CONFIG)
 
@@ -354,34 +351,46 @@ with tab3:
     if not bookmarks:
         st.info("お気に入りがまだありません。「銘柄分析」タブまたはスクリーナーの「🔖 お気に入りに追加」ボタンで登録できます。")
     else:
-        # Selectbox to pick a stock
-        bm_options = [f"{name}（{ticker}）" for ticker, name in bookmarks.items()]
-        bm_tickers = list(bookmarks.keys())
-
-        fav_col1, fav_col2, fav_col3 = st.columns([3, 1, 1])
-        with fav_col1:
-            choice = st.selectbox("銘柄を選択", bm_options, key="fav_select")
-        with fav_col2:
-            fav_period_options = {"3ヶ月": "3mo", "6ヶ月": "6mo", "1年": "1y", "2年": "2y", "5年": "5y"}
+        fav_period_options = {"3ヶ月": "3mo", "6ヶ月": "6mo", "1年": "1y", "2年": "2y", "5年": "5y"}
+        opt_col1, opt_col2 = st.columns([2, 2])
+        with opt_col1:
             fav_period = st.selectbox("期間", list(fav_period_options.keys()), index=2, key="fav_period")
-        with fav_col3:
+        with opt_col2:
             fav_pivot = st.slider("ピボット感度", 3, 15, 5, key="fav_pivot")
 
-        selected_idx = bm_options.index(choice)
-        fav_ticker = bm_tickers[selected_idx]
-        fav_name = bookmarks[fav_ticker]
+        # Clickable table — row selection triggers chart display
+        bm_rows = [{"会社名": n, "銘柄コード": t} for t, n in bookmarks.items()]
+        bm_df = pd.DataFrame(bm_rows)
+        bm_tickers = list(bookmarks.keys())
 
-        btn_c1, btn_c2 = st.columns([3, 1])
-        with btn_c1:
-            show_fav = st.button("チャートを表示", type="primary", use_container_width=True, key="fav_show")
-        with btn_c2:
-            if st.button("🗑️ 削除", use_container_width=True, key="fav_del"):
-                remove_bookmark(fav_ticker)
-                st.success(f"**{fav_name}** をお気に入りから削除しました。")
+        st.caption("👇 行をクリックするとチャートが表示されます")
+        selection = st.dataframe(
+            bm_df,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="fav_table",
+        )
+
+        selected_rows = selection.selection.rows if selection.selection else []
+
+        # Delete button row
+        del_col1, del_col2 = st.columns([4, 1])
+        with del_col2:
+            if selected_rows and st.button("🗑️ 選択を削除", use_container_width=True, key="fav_del"):
+                del_ticker = bm_tickers[selected_rows[0]]
+                del_name = bookmarks[del_ticker]
+                remove_bookmark(del_ticker)
+                st.success(f"**{del_name}** をお気に入りから削除しました。")
                 st.rerun()
 
-        if show_fav:
-            st.markdown(f"#### {fav_name}（{fav_ticker}）")
+        # Auto-render chart for selected row
+        if selected_rows:
+            idx = selected_rows[0]
+            fav_ticker = bm_tickers[idx]
+            fav_name = bookmarks[fav_ticker]
+            st.markdown(f"---\n#### {fav_name}（{fav_ticker}）")
             render_stock_chart(
                 fav_ticker, fav_name,
                 fav_period_options[fav_period],
@@ -389,9 +398,3 @@ with tab3:
                 n_lines=3,
                 show_volume=True,
             )
-
-        # Bookmark list
-        st.markdown("---")
-        st.markdown("**登録済み銘柄一覧**")
-        bm_rows = [{"銘柄コード": t, "会社名": n} for t, n in bookmarks.items()]
-        st.dataframe(pd.DataFrame(bm_rows), use_container_width=True, hide_index=True)
