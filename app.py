@@ -2,12 +2,11 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
 
 from trendline import get_support_resistance_lines, score_uptrend
 from screener import run_screener
-from stock_names import search_by_name, get_name, TICKER_TO_NAME
+from stock_names import search_by_name, get_name
 
 st.set_page_config(
     page_title="株価トレンドライン分析",
@@ -17,13 +16,80 @@ st.set_page_config(
 
 st.title("📈 株価トレンドライン分析")
 
+
+# ── Shared chart builder ───────────────────────────────────────────────────────
+def build_chart(df: pd.DataFrame, ticker: str, name: str, pivot_window: int, n_lines: int, highlight_support: bool = False) -> go.Figure:
+    lines = get_support_resistance_lines(df, window=pivot_window, n_lines=n_lines)
+    dates = df.index.tolist()
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=dates,
+        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="ローソク足",
+        increasing_line_color="#26a69a",
+        decreasing_line_color="#ef5350",
+    ))
+
+    color_map = {"resistance": "#ef5350", "support": "#26a69a"}
+    label_map = {"resistance": "抵抗線", "support": "支持線"}
+    shown_labels: set = set()
+
+    for line in lines:
+        x0_date = dates[line["x0"]]
+        ext_x1 = min(len(dates) - 1, line["x1"] + 20)
+        ext_date = dates[ext_x1]
+        ext_y1 = line["intercept"] + line["slope"] * ext_x1
+        label = label_map[line["type"]]
+        show_legend = label not in shown_labels
+        shown_labels.add(label)
+
+        # サポートライン接近モードでは支持線を太く強調
+        width = 3 if (highlight_support and line["type"] == "support") else 2
+        dash = "solid" if (highlight_support and line["type"] == "support") else "dot"
+
+        fig.add_trace(go.Scatter(
+            x=[x0_date, ext_date],
+            y=[line["y0"], ext_y1],
+            mode="lines",
+            name=label,
+            showlegend=show_legend,
+            line=dict(color=color_map[line["type"]], width=width, dash=dash),
+            hovertemplate=f"{label}<br>R²={line['r2']:.2f}<br>傾き={line['slope_pct']:+.3f}%/日<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=f"{name} ({ticker})",
+        xaxis_title="日付",
+        yaxis_title="株価",
+        xaxis_rangeslider_visible=False,
+        height=400,
+        template="plotly_dark",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(t=60, b=40),
+    )
+    return fig
+
+
+def fetch_df(ticker: str, period: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        if df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception:
+        return None
+
+
+# ── Tab layout ─────────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["🔍 銘柄分析", "⭐ 銘柄おすすめ"])
 
 
 # ── Tab 1: Individual stock analysis ──────────────────────────────────────────
 with tab1:
     col_left, col_right = st.columns([3, 1])
-
     with col_left:
         search_query = st.text_input(
             "銘柄コードまたは会社名で検索（例: 7203、トヨタ、ソニー）",
@@ -34,23 +100,18 @@ with tab1:
         period_options = {"3ヶ月": "3mo", "6ヶ月": "6mo", "1年": "1y", "2年": "2y", "5年": "5y"}
         period_label = st.selectbox("期間", list(period_options.keys()), index=2)
 
-    # Resolve ticker from search query
     selected_ticker = ""
     selected_name = ""
 
     if search_query:
         query = search_query.strip()
-
-        # Pure numeric → add .T suffix
         if query.isdigit():
             selected_ticker = query + ".T"
             selected_name = get_name(selected_ticker)
-        # Already has .T
         elif query.upper().endswith(".T"):
             selected_ticker = query.upper()
             selected_name = get_name(selected_ticker)
         else:
-            # Search by name
             candidates = search_by_name(query)
             if len(candidates) == 1:
                 selected_ticker, selected_name = candidates[0]
@@ -71,89 +132,31 @@ with tab1:
     with col_w3:
         show_volume = st.checkbox("出来高を表示", value=True)
 
-    draw_disabled = not bool(selected_ticker)
-    if st.button("チャートを描画", type="primary", use_container_width=True, disabled=draw_disabled):
-        ticker = selected_ticker
+    if st.button("チャートを描画", type="primary", use_container_width=True, disabled=not selected_ticker):
+        with st.spinner(f"{selected_name or selected_ticker} のデータを取得中..."):
+            df = fetch_df(selected_ticker, period_options[period_label])
 
-        with st.spinner(f"{selected_name or ticker} のデータを取得中..."):
-            try:
-                df = yf.download(
-                    ticker,
-                    period=period_options[period_label],
-                    auto_adjust=True,
-                    progress=False,
-                )
-                if df.empty:
-                    st.error("データを取得できませんでした。銘柄コードを確認してください。")
-                    st.stop()
+        if df is None:
+            st.error("データを取得できませんでした。")
+            st.stop()
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-
-                current_price = float(df["Close"].iloc[-1])
-                prev_price = float(df["Close"].iloc[-2])
-                change_pct = (current_price - prev_price) / prev_price * 100
-
-            except Exception as e:
-                st.error(f"エラー: {e}")
-                st.stop()
-
-        name = selected_name or get_name(ticker)
+        name = selected_name or get_name(selected_ticker)
+        current_price = float(df["Close"].iloc[-1])
+        prev_price = float(df["Close"].iloc[-2])
+        change_pct = (current_price - prev_price) / prev_price * 100
+        metrics = score_uptrend(df)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("銘柄", name)
         m2.metric("現在値", f"¥{current_price:,.0f}")
         m3.metric("前日比", f"{change_pct:+.2f}%", delta=f"{change_pct:+.2f}%")
-        metrics = score_uptrend(df)
         m4.metric("トレンドスコア", f"{metrics['score']:.1f}",
                   help="長期上昇トレンドの強さ。高いほど安定した右肩上がり")
 
-        lines = get_support_resistance_lines(df, window=pivot_window, n_lines=n_lines)
-        dates = df.index.tolist()
-
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=dates,
-            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            name="ローソク足",
-            increasing_line_color="#26a69a",
-            decreasing_line_color="#ef5350",
-        ))
-
-        color_map = {"resistance": "#ef5350", "support": "#26a69a"}
-        label_map = {"resistance": "抵抗線", "support": "支持線"}
-        shown_labels: set = set()
-
-        for line in lines:
-            x0_date = dates[line["x0"]]
-            ext_x1 = min(len(dates) - 1, line["x1"] + 20)
-            ext_date = dates[ext_x1]
-            ext_y1 = line["intercept"] + line["slope"] * ext_x1
-            label = label_map[line["type"]]
-            show_legend = label not in shown_labels
-            shown_labels.add(label)
-
-            fig.add_trace(go.Scatter(
-                x=[x0_date, ext_date],
-                y=[line["y0"], ext_y1],
-                mode="lines",
-                name=label,
-                showlegend=show_legend,
-                line=dict(color=color_map[line["type"]], width=2, dash="dot"),
-                hovertemplate=f"{label}<br>R²={line['r2']:.2f}<br>傾き={line['slope_pct']:+.2f}%/日<extra></extra>",
-            ))
-
-        fig.update_layout(
-            title=f"{name} ({ticker})",
-            xaxis_title="日付",
-            yaxis_title="株価",
-            xaxis_rangeslider_visible=False,
-            height=550,
-            template="plotly_dark",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        )
+        fig = build_chart(df, selected_ticker, name, pivot_window, n_lines)
 
         if show_volume and "Volume" in df.columns:
+            dates = df.index.tolist()
             fig_vol = go.Figure(go.Bar(
                 x=dates, y=df["Volume"],
                 name="出来高", marker_color="#7986cb", opacity=0.6,
@@ -167,25 +170,11 @@ with tab1:
         else:
             st.plotly_chart(fig, use_container_width=True)
 
-        if lines:
-            st.subheader("検出されたトレンドライン")
-            tl_rows = [
-                {
-                    "種別": label_map[l["type"]],
-                    "R²（信頼度）": f"{l['r2']:.3f}",
-                    "傾き（%/日）": f"{l['slope_pct']:+.3f}",
-                    "タッチ点数": l["pivot_count"],
-                }
-                for l in lines
-            ]
-            st.dataframe(pd.DataFrame(tl_rows), use_container_width=True, hide_index=True)
-
         with st.expander("トレンドスコア詳細"):
             sc1, sc2, sc3 = st.columns(3)
             sc1.metric("年換算上昇率", f"{metrics['slope_pct']:+.1f}%")
             sc2.metric("R²（当てはまり）", f"{metrics['r2']:.3f}")
             sc3.metric("一貫性", f"{metrics['consistency']*100:.1f}%")
-            st.caption("スコア = 年換算上昇率 × R² × 一貫性。長期で安定して右肩上がりの銘柄ほど高くなります。")
 
 
 # ── Tab 2: Screener ───────────────────────────────────────────────────────────
@@ -197,7 +186,7 @@ with tab2:
         sc_period_map = {"1年": "1y", "2年": "2y", "3年": "3y"}
         sc_period_label = st.selectbox("分析期間", list(sc_period_map.keys()), index=1, key="sc_period")
     with sc_col2:
-        top_n = st.slider("表示件数", 5, 30, 15, key="sc_top")
+        top_n = st.slider("表示件数", 5, 20, 10, key="sc_top")
     with sc_col3:
         screen_mode = st.radio(
             "表示モード",
@@ -205,64 +194,88 @@ with tab2:
             horizontal=True,
         )
 
-    # Support proximity threshold (shown only in support mode)
     support_threshold = 5.0
+    chart_period = "1y"
     if "サポートライン" in screen_mode:
-        support_threshold = st.slider(
-            "サポートラインからの距離（%以内）",
-            min_value=1, max_value=20, value=5,
-            help="現在値がサポートラインから何%以内の銘柄を表示するか",
-        )
+        sp_col1, sp_col2 = st.columns(2)
+        with sp_col1:
+            support_threshold = st.slider(
+                "サポートラインからの距離（%以内）", 1, 20, 5,
+                help="現在値がサポートラインから何%以内の銘柄を表示するか",
+            )
+        with sp_col2:
+            chart_period_label = st.selectbox("チャート表示期間", ["6ヶ月", "1年", "2年"], index=1)
+            chart_period = {"6ヶ月": "6mo", "1年": "1y", "2年": "2y"}[chart_period_label]
 
     if st.button("スクリーニング実行", type="primary", use_container_width=True):
         with st.spinner("銘柄をスキャン中（1〜2分かかります）..."):
-            result_df = run_screener(period=sc_period_map[sc_period_label])
+            st.session_state["screener_result"] = run_screener(period=sc_period_map[sc_period_label])
+            st.session_state["screener_mode"] = screen_mode
+            st.session_state["screener_threshold"] = support_threshold
+            st.session_state["screener_chart_period"] = chart_period
+            st.session_state["screener_top_n"] = top_n
+
+    # ── Display results (persisted in session_state) ──
+    if "screener_result" in st.session_state:
+        result_df = st.session_state["screener_result"]
+        mode = st.session_state.get("screener_mode", screen_mode)
+        threshold = st.session_state.get("screener_threshold", support_threshold)
+        c_period = st.session_state.get("screener_chart_period", chart_period)
+        c_top_n = st.session_state.get("screener_top_n", top_n)
 
         if result_df.empty:
             st.warning("結果が見つかりませんでした。")
             st.stop()
 
-        if "サポートライン" in screen_mode:
-            # Filter: price within threshold% above support
+        if "サポートライン" in mode:
             filtered = result_df[
                 (result_df["support_dist"] >= 0) &
-                (result_df["support_dist"] <= support_threshold) &
+                (result_df["support_dist"] <= threshold) &
                 (result_df["score"] > 0)
-            ].copy()
-            filtered = filtered.sort_values("support_dist").reset_index(drop=True)
-            filtered.index += 1
-            display_df = filtered.head(top_n)
+            ].sort_values("support_dist").head(c_top_n)
 
-            st.subheader(f"🎯 サポートライン接近銘柄（{support_threshold}%以内）上位 {len(display_df)} 件")
-            st.caption("長期上昇トレンド中かつ現在値がサポートラインに近い＝買い場の候補です。")
+            st.subheader(f"🎯 サポートライン接近銘柄（{threshold}%以内）— {len(filtered)} 件")
+            st.caption("長期上昇トレンド中かつ現在値がサポートラインに近い＝買い場の候補です。支持線は実線で強調表示しています。")
 
-            if display_df.empty:
-                st.info(f"サポートラインから{support_threshold}%以内の銘柄は現在見つかりませんでした。閾値を広げてみてください。")
+            if filtered.empty:
+                st.info(f"サポートラインから{threshold}%以内の銘柄は現在見つかりませんでした。閾値を広げてみてください。")
             else:
-                fig_bar = go.Figure(go.Bar(
-                    x=display_df["support_dist"],
-                    y=display_df["name"],
-                    orientation="h",
-                    marker_color="#ffa726",
-                    text=[f"{v:.1f}%" for v in display_df["support_dist"]],
-                    textposition="outside",
-                ))
-                fig_bar.update_layout(
-                    height=max(300, len(display_df) * 30),
-                    template="plotly_dark",
-                    xaxis_title="サポートラインからの距離（%）",
-                    yaxis=dict(autorange="reversed"),
-                    margin=dict(l=200),
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-
-                show_cols = display_df[["ticker", "name", "current_price", "support_dist", "slope_pct", "score"]].copy()
+                # Summary table
+                show_cols = filtered[["ticker", "name", "current_price", "support_dist", "slope_pct", "score"]].copy()
                 show_cols.columns = ["コード", "銘柄名", "現在値(円)", "サポートまで(%)", "年換算上昇率(%)", "スコア"]
-                st.dataframe(show_cols, use_container_width=True)
+                st.dataframe(show_cols, use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+                st.markdown("#### 各銘柄のチャート（支持線：緑の実線）")
+
+                # Render a chart per stock
+                for _, row in filtered.iterrows():
+                    ticker = row["ticker"]
+                    name = row["name"]
+                    dist = row["support_dist"]
+
+                    with st.expander(f"📊 {name}（{ticker}）― サポートまで {dist:.1f}%", expanded=True):
+                        with st.spinner(f"{name} のチャートを描画中..."):
+                            df = fetch_df(ticker, c_period)
+
+                        if df is None:
+                            st.warning("データを取得できませんでした。")
+                            continue
+
+                        current_price = float(df["Close"].iloc[-1])
+                        prev_price = float(df["Close"].iloc[-2])
+                        change_pct = (current_price - prev_price) / prev_price * 100
+
+                        mc1, mc2, mc3 = st.columns(3)
+                        mc1.metric("現在値", f"¥{current_price:,.0f}")
+                        mc2.metric("前日比", f"{change_pct:+.2f}%", delta=f"{change_pct:+.2f}%")
+                        mc3.metric("年換算上昇率", f"{row['slope_pct']:+.1f}%")
+
+                        fig = build_chart(df, ticker, name, pivot_window=5, n_lines=3, highlight_support=True)
+                        st.plotly_chart(fig, use_container_width=True)
 
         else:
-            display_df = result_df.sort_values("score", ascending=False).head(top_n)
-
+            display_df = result_df.sort_values("score", ascending=False).head(c_top_n)
             st.subheader(f"📈 トレンドスコア上位 {len(display_df)} 銘柄")
 
             fig_bar = go.Figure(go.Bar(
@@ -284,8 +297,5 @@ with tab2:
 
             show_cols = display_df[["ticker", "name", "current_price", "slope_pct", "r2", "consistency", "score"]].copy()
             show_cols.columns = ["コード", "銘柄名", "現在値(円)", "年換算上昇率(%)", "R²", "一貫性(%)", "スコア"]
-            st.dataframe(show_cols, use_container_width=True)
-
+            st.dataframe(show_cols, use_container_width=True, hide_index=True)
             st.caption("スコア = 年換算上昇率(%) × R²（安定性） × 一貫性（上昇日割合）")
-
-        st.info("気になる銘柄は「銘柄分析」タブでコードか会社名を入力するとトレンドラインが確認できます。")
